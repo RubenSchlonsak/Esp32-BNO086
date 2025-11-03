@@ -351,7 +351,7 @@ Examples:
     p.add_argument("--reset", metavar="PORT", help="Reset COM Port (löst Windows Locks)")
     p.add_argument("--auto", action="store_true", help="Auto-detect ESP32 Port")
     p.add_argument("--port", help="COM Port (z.B. COM6)")
-    p.add_argument("--baud", type=int, default=921600, help="Baudrate (default: 921600)")
+    p.add_argument("--baud", type=int, default=115200, help="Baudrate (default: 115200)")
     p.add_argument("--duration", type=float, default=60.0, help="Aufnahmedauer in Sekunden (0 = unlimited)")
     p.add_argument("--outfile", help="Output CSV Dateiname")
     p.add_argument("--echo", action="store_true", help="Zeige Daten im Terminal")
