@@ -10,65 +10,45 @@ sh2_SensorValue_t v;
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) delay(10);
-
-  Serial.println("\n\n# BNO086 RAW Test Start");
+  delay(500);
 
   Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
 
-  if (!bno.begin_I2C(0x4B, &Wire)) {
-    if (!bno.begin_I2C(0x4A, &Wire)) {
-      Serial.println("# FAIL: Sensor not found!");
-      while (1) delay(100);
+  // BNO Bootzeit
+  delay(300);
+
+  bool ok = false;
+  for (int i = 0; i < 5 && !ok; ++i) {
+    if (bno.begin_I2C(0x4B, &Wire) || bno.begin_I2C(0x4A, &Wire)) {
+      ok = true;
+      break;
     }
+    Serial.println("# WARN: BNO086 not found, retry...");
+    delay(200);
   }
-  Serial.println("# OK: Sensor found");
-
-  // Workaround: mindestens EIN „normaler“ Report + RAW aktivieren
-  if (!bno.enableReport(SH2_ACCELEROMETER, 10000)) {
-    Serial.println("# WARN: could not enable ACCEL");
-  }
-  if (!bno.enableReport(SH2_RAW_ACCELEROMETER, 10000)) {
-    Serial.println("# WARN: could not enable RAW ACCEL");
+  if (!ok) {
+    Serial.println("# ERR: BNO086 not responding");
+    while (1) delay(1000);
   }
 
-  Serial.println("# Setup done\n");
+  // Reports
+  bno.enableReport(SH2_ACCELEROMETER,      10000);  // optional
+  bno.enableReport(SH2_RAW_ACCELEROMETER,  10000);  // 100 Hz RAW
+
+  // CSV-Header: Zeit in ms + RAW
+  Serial.println("t_ms,raw_x,raw_y,raw_z");
 }
 
 void loop() {
-  if (!bno.getSensorEvent(&v)) {
-    delay(1);
-    return;
-  }
+  if (!bno.getSensorEvent(&v)) return;
 
-  if (bno.wasReset()) {
-    Serial.println("# NOTE: IMU reset, re-enabling reports");
-    bno.enableReport(SH2_ACCELEROMETER, 10000);
-    bno.enableReport(SH2_RAW_ACCELEROMETER, 10000);
-  }
-
-  Serial.print("SensorID: ");
-  Serial.print(v.sensorId);
-  Serial.print(" | ");
-
-  switch (v.sensorId) {
-    case SH2_ACCELEROMETER:
-      //Serial.printf("Accel: %.3f, %.3f, %.3f\n",
-                    //v.un.accelerometer.x,
-                   // v.un.accelerometer.y,
-                   // v.un.accelerometer.z);
-      break;
-
-    case SH2_RAW_ACCELEROMETER:
-      // RAW = int16_t Counts → %d oder nach float casten
-      Serial.printf("Raw: %d, %d, %d (cts)\n",
-                    (int)v.un.rawAccelerometer.x,
-                    (int)v.un.rawAccelerometer.y,
-                    (int)v.un.rawAccelerometer.z);
-      break;
-
-    default:
-      Serial.println();
-      break;
+  if (v.sensorId == SH2_RAW_ACCELEROMETER) {
+    uint32_t t_ms = millis();  // Zeit seit Boot in ms
+    Serial.printf("%lu,%d,%d,%d\n",
+                  (unsigned long)t_ms,
+                  (int)v.un.rawAccelerometer.x,
+                  (int)v.un.rawAccelerometer.y,
+                  (int)v.un.rawAccelerometer.z);
   }
 }
