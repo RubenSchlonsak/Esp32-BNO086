@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import asyncio
 import threading
 import queue
@@ -7,69 +8,86 @@ import struct
 import datetime
 import tkinter as tk
 from tkinter import scrolledtext, filedialog, messagebox
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
 
+# Feste Adresse deines ESP32-IMU
+TARGET_ADDRESS = "50:78:7D:17:C5:69"
+
+# UUIDs müssen zu deinem ESP32-Sketch passen
 SERVICE_UUID      = "12345678-1234-1234-1234-123456789012"
 DATA_CHAR_UUID    = "abcdef12-3456-789a-bcde-123456789abc"
 CONTROL_CHAR_UUID = "12345678-1234-1234-1234-123456789013"
 
-MAGIC_V2 = 0xB0B0
-VER_V2   = 2
-REC_V2_SIZE = 14  # dt(u16) + 6*int16
+# Protokoll V2 (compact)
+MAGIC_V2    = 0xB0B0
+VER_V2      = 2
+REC_V2_SIZE = 14  # dt(u16) + 6 * int16
 
+# Legacy-Protokoll V1 (falls dein ESP noch sowas sendet)
 MAGIC_V1 = 0xBEEF
 VER_V1   = 1
+
 
 class BLEWorker(threading.Thread):
     def __init__(self, data_queue):
         super().__init__(daemon=True)
         self.loop = asyncio.new_event_loop()
         self.client = None
-        self.device_address = None
+        self.device_address = TARGET_ADDRESS
         self.data_queue = data_queue
         self.running = False
 
     async def find_and_connect(self):
-        devices = await BleakScanner.discover()
-        for d in devices:
-            if d.name == "ESP32-IMU":
-                self.device_address = d.address
-                break
         if not self.device_address:
-            self.data_queue.put({'type':'error','msg':'ESP32-IMU not found'})
+            self.data_queue.put({
+                'type': 'error',
+                'msg': 'Keine TARGET_ADDRESS gesetzt – bitte MAC-Adresse deines ESP32 eintragen.'
+            })
             return False
 
-        self.client = BleakClient(self.device_address, loop=self.loop)
+        self.data_queue.put({
+            'type': 'info',
+            'msg': f"Connecting directly to {self.device_address}..."
+        })
+
+        # kein loop= verwenden
+        self.client = BleakClient(self.device_address)
         await self.client.connect()
 
-        # Determine MTU (platform dependent). On Linux, exchange_mtu works; others ignore.
+        # MTU / Payload defensiv bestimmen
         payload_cap = 20  # safe default (ATT_MTU 23 -> 20 payload)
         try:
-            if hasattr(self.client, "exchange_mtu"):
-                mtu = await self.client.exchange_mtu(247)
-                # bleak returns full MTU or None; usable payload = mtu-3
-                if isinstance(mtu, int) and mtu >= 23:
+            if hasattr(self.client, "mtu_size"):
+                mtu = int(getattr(self.client, "mtu_size"))
+                if mtu >= 23:
                     payload_cap = max(20, mtu - 3)
-                elif hasattr(self.client, "mtu_size"):
-                    payload_cap = max(20, int(getattr(self.client, "mtu_size")) - 3)
-            elif hasattr(self.client, "mtu_size"):
-                payload_cap = max(20, int(getattr(self.client, "mtu_size")) - 3)
         except Exception as e:
-            self.data_queue.put({'type':'info','msg':f"MTU info unavailable: {e}"})
+            self.data_queue.put({'type': 'info', 'msg': f"MTU info unavailable: {e}"})
 
-        # Tell firmware the usable payload so it can size packets
+        # Firmware über nutzbare Payload informieren (für Packing)
         try:
-            await self.client.write_gatt_char(CONTROL_CHAR_UUID, f"MTU:{payload_cap}".encode())
-            self.data_queue.put({'type':'info','msg':f"Usable payload = {payload_cap} bytes (told device)"})
+            await self.client.write_gatt_char(
+                CONTROL_CHAR_UUID,
+                f"MTU:{payload_cap}".encode()
+            )
+            self.data_queue.put({
+                'type': 'info',
+                'msg': f"Usable payload = {payload_cap} bytes (told device)"
+            })
         except Exception as e:
-            self.data_queue.put({'type':'info','msg':f"Could not send MTU to device: {e}"})
+            self.data_queue.put({
+                'type': 'info',
+                'msg': f"Could not send MTU to device: {e}"
+            })
 
+        # Notifications starten
         await self.client.start_notify(DATA_CHAR_UUID, self.notification_handler)
-        self.data_queue.put({'type':'info','msg':'🔗 Connected'})
+        self.data_queue.put({'type': 'info', 'msg': '🔗 Connected'})
         return True
 
     def parse_v2(self, b: bytes):
-        if len(b) < 4: return None
+        if len(b) < 4:
+            return None
         magic = b[0] | (b[1] << 8)
         ver   = b[2]
         if magic != MAGIC_V2 or ver != VER_V2:
@@ -78,26 +96,30 @@ class BLEWorker(threading.Thread):
         needed = 4 + count * REC_V2_SIZE
         if len(b) < needed:
             return None
+
         offs = 4
         samples = []
-        # reconstruct absolute esp_timestamp from dt sums (ms)
         t_abs = 0
         ts_pc = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        for i in range(count):
-            dt = struct.unpack_from("<H", b, offs)[0]; offs += 2
+
+        for _ in range(count):
+            dt = struct.unpack_from("<H", b, offs)[0]
+            offs += 2
             t_abs += dt
-            ax, ay, az, gx, gy, gz = struct.unpack_from("<hhhhhh", b, offs); offs += 12
+            ax, ay, az, gx, gy, gz = struct.unpack_from("<hhhhhh", b, offs)
+            offs += 12
             samples.append({
                 'pc_timestamp': ts_pc,
-                'esp_timestamp': t_abs,  # relative ms since first sample in stream; you can realign later
-                'accel': [ax/1000.0, ay/1000.0, az/1000.0],   # mg -> g
-                'gyro':  [gx/1000.0, gy/1000.0, gz/1000.0],   # mdps -> dps
+                'esp_timestamp': t_abs,  # relative ms im Stream
+                'accel': [ax / 1000.0, ay / 1000.0, az / 1000.0],
+                'gyro':  [gx / 1000.0, gy / 1000.0, gz / 1000.0],
             })
         return samples
 
     def parse_v1(self, b: bytes):
         # legacy: u16 magic | u8 ver | u8 count | u32 seq_start | count*(u32 t_ms + 6*float)
-        if len(b) < 8: return None
+        if len(b) < 8:
+            return None
         magic = b[0] | (b[1] << 8)
         ver   = b[2]
         if magic != MAGIC_V1 or ver != VER_V1:
@@ -106,12 +128,16 @@ class BLEWorker(threading.Thread):
         needed = 8 + count * (4 + 24)
         if len(b) < needed:
             return None
+
         offs = 8
         ts_pc = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         samples = []
-        for i in range(count):
-            t_ms = struct.unpack_from("<I", b, offs)[0]; offs += 4
-            ax, ay, az, gx, gy, gz = struct.unpack_from("<ffffff", b, offs); offs += 24
+
+        for _ in range(count):
+            t_ms = struct.unpack_from("<I", b, offs)[0]
+            offs += 4
+            ax, ay, az, gx, gy, gz = struct.unpack_from("<ffffff", b, offs)
+            offs += 24
             samples.append({
                 'pc_timestamp': ts_pc,
                 'esp_timestamp': t_ms,
@@ -120,35 +146,37 @@ class BLEWorker(threading.Thread):
             })
         return samples
 
-    async def notification_handler(self, sender, data: bytearray):
-        # Try v2 compact
+    # synchroner Callback für Bleak
+    def notification_handler(self, sender, data: bytearray):
         s = self.parse_v2(data)
         if s is not None:
             for e in s:
-                self.data_queue.put({'type':'data','entry':e})
+                self.data_queue.put({'type': 'data', 'entry': e})
             return
-        # Try v1 legacy
+
         s = self.parse_v1(data)
         if s is not None:
             for e in s:
-                self.data_queue.put({'type':'data','entry':e})
+                self.data_queue.put({'type': 'data', 'entry': e})
             return
-        # Finally, try JSON (battery/warnings). If it fails, ignore silently (it's binary noise).
+
+        # JSON-Fallback (Status/Battery)
         try:
             payload = json.loads(data.decode('utf-8'))
-            self.data_queue.put({'type':'json','obj':payload})
+            self.data_queue.put({'type': 'json', 'obj': payload})
         except Exception:
-            # do not spam errors on binary payloads
             return
 
     async def handle_commands(self):
         while self.running:
             await asyncio.sleep(0.05)
         if self.client and self.client.is_connected:
-            try: await self.client.stop_notify(DATA_CHAR_UUID)
-            except Exception: pass
+            try:
+                await self.client.stop_notify(DATA_CHAR_UUID)
+            except Exception:
+                pass
             await self.client.disconnect()
-            self.data_queue.put({'type':'info','msg':'🔌 Disconnected'})
+            self.data_queue.put({'type': 'info', 'msg': '🔌 Disconnected'})
 
     def run(self):
         self.running = True
@@ -158,7 +186,7 @@ class BLEWorker(threading.Thread):
             if connected:
                 self.loop.run_until_complete(self.handle_commands())
         except Exception as e:
-            self.data_queue.put({'type':'error','msg':str(e)})
+            self.data_queue.put({'type': 'error', 'msg': str(e)})
         finally:
             self.loop.close()
 
@@ -168,7 +196,7 @@ class BLEWorker(threading.Thread):
                 self.client.write_gatt_char(CONTROL_CHAR_UUID, command.encode()),
                 self.loop
             )
-            self.data_queue.put({'type':'info','msg':f"Sent: {command}"})
+            self.data_queue.put({'type': 'info', 'msg': f"Sent: {command}"})
 
     def stop(self):
         self.running = False
@@ -251,17 +279,23 @@ class IMUGUI:
                 if msg['type'] == 'data':
                     e = msg['entry']
                     self.seq += 1
-                    line = (f"{e['pc_timestamp']} | #{self.seq:08d} "
-                            f"A[{e['accel'][0]:.3f}, {e['accel'][1]:.3f}, {e['accel'][2]:.3f}] "
-                            f"G[{e['gyro'][0]:.3f}, {e['gyro'][1]:.3f}, {e['gyro'][2]:.3f}]\n")
+                    line = (
+                        f"{e['pc_timestamp']} | #{self.seq:08d} "
+                        f"A[{e['accel'][0]:.3f}, {e['accel'][1]:.3f}, {e['accel'][2]:.3f}] "
+                        f"G[{e['gyro'][0]:.3f}, {e['gyro'][1]:.3f}, {e['gyro'][2]:.3f}]\n"
+                    )
                     self.append_log(line)
                     if self.recording:
                         self.data_log.append({
                             'pc_timestamp': e['pc_timestamp'],
                             'seq': self.seq,
                             'esp_timestamp_ms': e['esp_timestamp'],
-                            'ax_g': e['accel'][0], 'ay_g': e['accel'][1], 'az_g': e['accel'][2],
-                            'gx_dps': e['gyro'][0], 'gy_dps': e['gyro'][1], 'gz_dps': e['gyro'][2],
+                            'ax_g': e['accel'][0],
+                            'ay_g': e['accel'][1],
+                            'az_g': e['accel'][2],
+                            'gx_dps': e['gyro'][0],
+                            'gy_dps': e['gyro'][1],
+                            'gz_dps': e['gyro'][2],
                         })
                 elif msg['type'] == 'json':
                     self.append_log(f"JSON: {json.dumps(msg['obj'])}\n")
@@ -284,16 +318,23 @@ class IMUGUI:
         if not self.data_log:
             messagebox.showinfo("Info", "No data to save")
             return
-        fname = filedialog.asksaveasfilename(defaultextension='.csv',
-                                             filetypes=[('CSV Files','*.csv')])
+        fname = filedialog.asksaveasfilename(
+            defaultextension='.csv',
+            filetypes=[('CSV Files', '*.csv')]
+        )
         if not fname:
             return
-        fields = ['pc_timestamp','seq','esp_timestamp_ms','ax_g','ay_g','az_g','gx_dps','gy_dps','gz_dps']
+        fields = [
+            'pc_timestamp', 'seq', 'esp_timestamp_ms',
+            'ax_g', 'ay_g', 'az_g',
+            'gx_dps', 'gy_dps', 'gz_dps'
+        ]
         with open(fname, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             writer.writerows(self.data_log)
         messagebox.showinfo("Success", f"CSV saved: {fname}")
+
 
 if __name__ == '__main__':
     root = tk.Tk()
