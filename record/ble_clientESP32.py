@@ -11,8 +11,9 @@ from tkinter import scrolledtext, filedialog, messagebox
 from bleak import BleakClient
 
 # Feste Adresse deines ESP32-IMU
-TARGET_ADDRESS = "50:78:7D:17:C5:69"
-
+#TARGET_ADDRESS = "50:78:7D:17:C5:69"
+# Esp32 Qwicc
+TARGET_ADDRESS = "10:20:ba:0e:3f:49"
 # UUIDs müssen zu deinem ESP32-Sketch passen
 SERVICE_UUID      = "12345678-1234-1234-1234-123456789012"
 DATA_CHAR_UUID    = "abcdef12-3456-789a-bcde-123456789abc"

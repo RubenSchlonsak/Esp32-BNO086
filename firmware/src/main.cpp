@@ -9,8 +9,13 @@
 #include "SparkFun_BMI270_Arduino_Library.h"
 
 // I2C Pins
-#define SDA_PIN 9
-#define SCL_PIN 8
+//Esp32 Super mini
+//#define SDA_PIN 9
+//#define SCL_PIN 8
+//Esp32 S3 qwicc 
+#define SDA_PIN 41
+#define SCL_PIN 40
+
 
 // BLE UUIDs – passend zum Python-Script
 static const char* SERVICE_UUID      = "12345678-1234-1234-1234-123456789012";
